@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+from pathlib import Path
 from typing import Annotated, Any, Optional, TypedDict
 
 import requests
@@ -18,7 +19,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import InjectedState, ToolNode, tools_condition
+
 
 load_dotenv()
 
@@ -34,15 +36,89 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+DATABASE_PATH = BASE_DIR / "chatbot.db"
+
+FAISS_BASE_DIR = BASE_DIR / "faiss_indexes"
+
+FAISS_BASE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
 _THREAD_RETRIEVERS: dict[str, Any] = {}
-_THREAD_METADATA: dict[str, dict] = {}
+
+
+connection = sqlite3.connect(
+    str(DATABASE_PATH),
+    check_same_thread=False,
+)
+
+
+connection.execute(
+    """
+    CREATE TABLE IF NOT EXISTS thread_documents (
+        thread_id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        documents INTEGER NOT NULL,
+        chunks INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+)
+
+connection.commit()
+
+
+def _get_faiss_dir(thread_id: str):
+
+    return FAISS_BASE_DIR / str(thread_id)
 
 
 def _get_retriever(thread_id: Optional[str]):
+
     if not thread_id:
         return None
 
-    return _THREAD_RETRIEVERS.get(str(thread_id))
+    thread_id = str(thread_id)
+
+    retriever = _THREAD_RETRIEVERS.get(
+        thread_id
+    )
+
+    if retriever is not None:
+        return retriever
+
+    index_dir = _get_faiss_dir(
+        thread_id
+    )
+
+    if not (index_dir / "index.faiss").exists():
+        return None
+
+    if not (index_dir / "index.pkl").exists():
+        return None
+
+    vector_store = FAISS.load_local(
+        str(index_dir),
+        embeddings,
+        allow_dangerous_deserialization=True,
+    )
+
+    retriever = vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": 4,
+        },
+    )
+
+    _THREAD_RETRIEVERS[
+        thread_id
+    ] = retriever
+
+    return retriever
 
 
 def ingest_pdf(
@@ -56,17 +132,29 @@ def ingest_pdf(
 
     thread_id = str(thread_id)
 
+    filename = filename or "uploaded.pdf"
+
     with tempfile.NamedTemporaryFile(
         delete=False,
         suffix=".pdf",
     ) as temp_file:
 
         temp_file.write(file_bytes)
+
         temp_path = temp_file.name
 
     try:
-        loader = PyPDFLoader(temp_path)
+
+        loader = PyPDFLoader(
+            temp_path
+        )
+
         documents = loader.load()
+
+        if not documents:
+            raise ValueError(
+                "Could not extract any content from the PDF."
+            )
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -83,9 +171,27 @@ def ingest_pdf(
             documents
         )
 
+        if not chunks:
+            raise ValueError(
+                "PDF could not be split into chunks."
+            )
+
         vector_store = FAISS.from_documents(
             chunks,
             embeddings,
+        )
+
+        index_dir = _get_faiss_dir(
+            thread_id
+        )
+
+        index_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        vector_store.save_local(
+            str(index_dir)
         )
 
         retriever = vector_store.as_retriever(
@@ -95,17 +201,36 @@ def ingest_pdf(
             },
         )
 
-        _THREAD_RETRIEVERS[thread_id] = retriever
+        _THREAD_RETRIEVERS[
+            thread_id
+        ] = retriever
 
-        metadata = {
-            "filename": filename or "uploaded.pdf",
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO thread_documents
+            (
+                thread_id,
+                filename,
+                documents,
+                chunks
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                thread_id,
+                filename,
+                len(documents),
+                len(chunks),
+            ),
+        )
+
+        connection.commit()
+
+        return {
+            "filename": filename,
             "documents": len(documents),
             "chunks": len(chunks),
         }
-
-        _THREAD_METADATA[thread_id] = metadata
-
-        return metadata
 
     finally:
 
@@ -113,6 +238,47 @@ def ingest_pdf(
             os.remove(temp_path)
         except OSError:
             pass
+
+
+def thread_document_metadata(
+    thread_id: str,
+) -> dict:
+
+    cursor = connection.execute(
+        """
+        SELECT
+            filename,
+            documents,
+            chunks
+        FROM thread_documents
+        WHERE thread_id = ?
+        """,
+        (
+            str(thread_id),
+        ),
+    )
+
+    row = cursor.fetchone()
+
+    if not row:
+        return {}
+
+    return {
+        "filename": row[0],
+        "documents": row[1],
+        "chunks": row[2],
+    }
+
+
+def thread_has_document(
+    thread_id: str,
+) -> bool:
+
+    return bool(
+        thread_document_metadata(
+            thread_id
+        )
+    )
 
 
 search_tool = DuckDuckGoSearchRun(
@@ -154,6 +320,7 @@ def calculator(
             result = first_num / second_num
 
         else:
+
             return {
                 "error": (
                     f"Unsupported operation: {operation}"
@@ -187,6 +354,7 @@ def get_stock_price(
     )
 
     if not api_key:
+
         return {
             "error": (
                 "Alpha Vantage API key is not configured."
@@ -200,27 +368,43 @@ def get_stock_price(
         f"&apikey={api_key}"
     )
 
-    response = requests.get(
-        url,
-        timeout=10,
-    )
+    try:
 
-    response.raise_for_status()
+        response = requests.get(
+            url,
+            timeout=10,
+        )
 
-    return response.json()
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception as error:
+
+        return {
+            "error": str(error)
+        }
 
 
 @tool
 def rag_tool(
     query: str,
-    thread_id: Optional[str] = None,
+    state: Annotated[
+        dict,
+        InjectedState,
+    ],
 ) -> dict:
     """
     Retrieve relevant information from the PDF
     uploaded in the current chat.
     """
 
+    thread_id = state.get(
+        "thread_id"
+    )
+
     if not thread_id:
+
         return {
             "error": "Chat session information is missing.",
             "query": query,
@@ -231,6 +415,7 @@ def rag_tool(
     )
 
     if retriever is None:
+
         return {
             "error": (
                 "No PDF is indexed for this chat. "
@@ -239,9 +424,18 @@ def rag_tool(
             "query": query,
         }
 
-    documents = retriever.invoke(
-        query
-    )
+    try:
+
+        documents = retriever.invoke(
+            query
+        )
+
+    except Exception as error:
+
+        return {
+            "error": f"PDF search failed: {error}",
+            "query": query,
+        }
 
     context = [
         document.page_content
@@ -253,14 +447,17 @@ def rag_tool(
         for document in documents
     ]
 
+    document_metadata = thread_document_metadata(
+        thread_id
+    )
+
     return {
         "query": query,
         "context": context,
         "metadata": metadata,
-        "source_file": _THREAD_METADATA.get(
-            str(thread_id),
-            {},
-        ).get("filename"),
+        "source_file": document_metadata.get(
+            "filename"
+        ),
     }
 
 
@@ -278,10 +475,13 @@ llm_with_tools = llm.bind_tools(
 
 
 class ChatState(TypedDict):
+
     messages: Annotated[
         list[BaseMessage],
         add_messages,
     ]
+
+    thread_id: str
 
 
 def chat_node(
@@ -289,24 +489,12 @@ def chat_node(
     config=None,
 ):
 
-    thread_id = None
-
-    if config and isinstance(config, dict):
-
-        thread_id = config.get(
-            "configurable",
-            {},
-        ).get(
-            "thread_id"
-        )
-
     system_message = SystemMessage(
         content=(
             "You are Chatbot, a helpful multi-utility "
             "AI assistant. "
             "For questions about an uploaded PDF, use "
-            "the `rag_tool` and pass the current chat "
-            "session identifier. "
+            "the `rag_tool`. "
             "You can use web search, stock price, and "
             "calculator tools when appropriate. "
             "If the user asks about a PDF and no PDF "
@@ -333,12 +521,6 @@ def chat_node(
 
 tool_node = ToolNode(
     tools
-)
-
-
-connection = sqlite3.connect(
-    "chatbot.db",
-    check_same_thread=False,
 )
 
 
@@ -387,41 +569,28 @@ chatbot = graph.compile(
 
 
 def retrieve_all_threads():
+
     threads = set()
 
-    for checkpoint in checkpointer.list(
-        None
-    ):
+    try:
 
-        thread_id = checkpoint.config[
-            "configurable"
-        ].get(
-            "thread_id"
-        )
+        for checkpoint in checkpointer.list(
+            None
+        ):
 
-        if thread_id:
-            threads.add(
-                thread_id
+            thread_id = checkpoint.config[
+                "configurable"
+            ].get(
+                "thread_id"
             )
 
+            if thread_id:
+                threads.add(
+                    thread_id
+                )
+
+    except Exception:
+
+        pass
+
     return list(threads)
-
-
-def thread_has_document(
-    thread_id: str,
-) -> bool:
-
-    return (
-        str(thread_id)
-        in _THREAD_RETRIEVERS
-    )
-
-
-def thread_document_metadata(
-    thread_id: str,
-) -> dict:
-
-    return _THREAD_METADATA.get(
-        str(thread_id),
-        {},
-    )
