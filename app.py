@@ -8,6 +8,7 @@ from langraph_rag_backend import (
     ingest_pdf,
     retrieve_all_threads,
     thread_document_metadata,
+    thread_has_document,
 )
 
 
@@ -57,18 +58,10 @@ if "thread_id" not in st.session_state:
 if "chat_threads" not in st.session_state:
     st.session_state["chat_threads"] = retrieve_all_threads()
 
-if "ingested_docs" not in st.session_state:
-    st.session_state["ingested_docs"] = {}
-
 
 add_thread(st.session_state["thread_id"])
 
 thread_key = st.session_state["thread_id"]
-
-thread_docs = st.session_state["ingested_docs"].setdefault(
-    thread_key,
-    {}
-)
 
 threads = st.session_state["chat_threads"][::-1]
 
@@ -86,13 +79,16 @@ if st.sidebar.button(
     st.rerun()
 
 
-if thread_docs:
-    latest_doc = list(thread_docs.values())[-1]
+thread_doc = thread_document_metadata(
+    thread_key
+)
 
+
+if thread_doc:
     st.sidebar.success(
-        f"📄 {latest_doc.get('filename')}\n\n"
-        f"{latest_doc.get('chunks')} chunks · "
-        f"{latest_doc.get('documents')} pages"
+        f"📄 {thread_doc.get('filename')}\n\n"
+        f"{thread_doc.get('chunks')} chunks · "
+        f"{thread_doc.get('documents')} pages"
     )
 else:
     st.sidebar.info("No PDF indexed yet.")
@@ -106,12 +102,25 @@ uploaded_pdf = st.sidebar.file_uploader(
 
 if uploaded_pdf:
 
-    if uploaded_pdf.name in thread_docs:
+    if thread_has_document(thread_key):
 
-        st.sidebar.info(
-            f"`{uploaded_pdf.name}` is already indexed "
-            "for this chat."
+        existing_doc = thread_document_metadata(
+            thread_key
         )
+
+        if existing_doc.get("filename") == uploaded_pdf.name:
+
+            st.sidebar.info(
+                f"`{uploaded_pdf.name}` is already indexed "
+                "for this chat."
+            )
+
+        else:
+
+            st.sidebar.warning(
+                "This chat already has a PDF. "
+                "Start a new chat to upload another PDF."
+            )
 
     else:
 
@@ -120,19 +129,35 @@ if uploaded_pdf:
             expanded=True,
         ) as status_box:
 
-            summary = ingest_pdf(
-                uploaded_pdf.getvalue(),
-                thread_id=thread_key,
-                filename=uploaded_pdf.name,
-            )
+            try:
 
-            thread_docs[uploaded_pdf.name] = summary
+                summary = ingest_pdf(
+                    uploaded_pdf.getvalue(),
+                    thread_id=thread_key,
+                    filename=uploaded_pdf.name,
+                )
 
-            status_box.update(
-                label="✅ PDF indexed",
-                state="complete",
-                expanded=False,
-            )
+                status_box.update(
+                    label="✅ PDF indexed",
+                    state="complete",
+                    expanded=False,
+                )
+
+                st.sidebar.success(
+                    f"📄 {summary.get('filename')}\n\n"
+                    f"{summary.get('chunks')} chunks · "
+                    f"{summary.get('documents')} pages"
+                )
+
+            except Exception as error:
+
+                status_box.update(
+                    label="❌ PDF indexing failed",
+                    state="error",
+                    expanded=True,
+                )
+
+                st.sidebar.error(str(error))
 
 
 st.sidebar.subheader("Past conversations")
@@ -146,14 +171,79 @@ if not threads:
 
 else:
 
-    for index, thread_id in enumerate(threads, start=1):
+    for index, thread_id in enumerate(
+        threads,
+        start=1,
+    ):
+
+        thread_doc = thread_document_metadata(
+            thread_id
+        )
+
+        if thread_doc:
+
+            button_label = (
+                f"Chat {index} · "
+                f"📄 {thread_doc.get('filename')}"
+            )
+
+        else:
+
+            button_label = f"Chat {index}"
 
         if st.sidebar.button(
-            f"Chat {index}",
+            button_label,
             key=f"side-thread-{thread_id}",
             use_container_width=True,
         ):
+
             selected_thread = thread_id
+
+
+if selected_thread:
+
+    st.session_state["thread_id"] = selected_thread
+
+    messages = load_conversation(
+        selected_thread
+    )
+
+    temp_messages = []
+
+    for message in messages:
+
+        if isinstance(
+            message,
+            HumanMessage,
+        ):
+
+            role = "user"
+
+        elif isinstance(
+            message,
+            AIMessage,
+        ):
+
+            role = "assistant"
+
+        else:
+
+            continue
+
+        content = message.content
+
+        if isinstance(content, str):
+
+            temp_messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
+
+    st.session_state["message_history"] = temp_messages
+
+    st.rerun()
 
 
 st.title("Chatbot")
@@ -208,55 +298,64 @@ if user_input:
 
         def ai_only_stream():
 
-            for message_chunk, _ in chatbot.stream(
-                {
-                    "messages": [
-                        HumanMessage(
-                            content=user_input
-                        )
-                    ]
-                },
-                config=config,
-                stream_mode="messages",
-            ):
+            try:
 
-                if isinstance(
-                    message_chunk,
-                    ToolMessage,
-                ):
-
-                    tool_name = getattr(
-                        message_chunk,
-                        "name",
-                        "tool",
-                    )
-
-                    if status_holder["box"] is None:
-
-                        status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}`...",
-                            expanded=True,
-                        )
-
-                    else:
-
-                        status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}`...",
-                            state="running",
-                            expanded=True,
-                        )
-
-
-                if isinstance(
-                    message_chunk,
-                    AIMessage,
+                for message_chunk, _ in chatbot.stream(
+                    {
+                        "messages": [
+                            HumanMessage(
+                                content=user_input
+                            )
+                        ],
+                        "thread_id": thread_key,
+                    },
+                    config=config,
+                    stream_mode="messages",
                 ):
 
                     if isinstance(
-                        message_chunk.content,
-                        str,
+                        message_chunk,
+                        ToolMessage,
                     ):
-                        yield message_chunk.content
+
+                        tool_name = getattr(
+                            message_chunk,
+                            "name",
+                            "tool",
+                        )
+
+                        if status_holder["box"] is None:
+
+                            status_holder["box"] = st.status(
+                                f"🔧 Using `{tool_name}`...",
+                                expanded=True,
+                            )
+
+                        else:
+
+                            status_holder["box"].update(
+                                label=f"🔧 Using `{tool_name}`...",
+                                state="running",
+                                expanded=True,
+                            )
+
+
+                    if isinstance(
+                        message_chunk,
+                        AIMessage,
+                    ):
+
+                        if isinstance(
+                            message_chunk.content,
+                            str,
+                        ):
+
+                            if message_chunk.content.strip():
+                                yield message_chunk.content
+
+            except Exception as error:
+
+                yield f"Error: {error}"
 
 
         ai_message = st.write_stream(
@@ -293,57 +392,3 @@ if user_input:
             f"{doc_meta.get('chunks')} chunks · "
             f"{doc_meta.get('documents')} pages"
         )
-
-
-if selected_thread:
-
-    st.session_state["thread_id"] = selected_thread
-
-    messages = load_conversation(
-        selected_thread
-    )
-
-    temp_messages = []
-
-    for message in messages:
-
-        if isinstance(
-            message,
-            HumanMessage,
-        ):
-            role = "user"
-
-        elif isinstance(
-            message,
-            AIMessage,
-        ):
-            role = "assistant"
-
-        else:
-            continue
-
-
-        content = message.content
-
-        if isinstance(content, str):
-
-            temp_messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                }
-            )
-
-
-    st.session_state["message_history"] = (
-        temp_messages
-    )
-
-    st.session_state[
-        "ingested_docs"
-    ].setdefault(
-        str(selected_thread),
-        {},
-    )
-
-    st.rerun()
